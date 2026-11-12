@@ -12,6 +12,9 @@ BLOCK_SIZE = int(os.getenv("PUMP_BLOCK_SIZE", "128"))
 # 单次上传 CSV 的最大字节数，避免误传超大文件打满内存
 MAX_UPLOAD_BYTES = int(os.getenv("PUMP_MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
 
+# 写锁竞争时的等待上限（秒）：并发导入时后到者等待，而不是直接 500
+BUSY_TIMEOUT_S = float(os.getenv("PUMP_BUSY_TIMEOUT_S", "30"))
+
 # 一次分桶查询允许的最大桶数，防止桶宽过小导致结果爆炸
 MAX_BUCKETS = int(os.getenv("PUMP_MAX_BUCKETS", "100000"))
 

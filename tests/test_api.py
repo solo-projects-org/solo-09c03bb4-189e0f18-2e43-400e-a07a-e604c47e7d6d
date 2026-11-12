@@ -322,3 +322,177 @@ def test_bucket_count_cap():
     )
     assert resp.status_code == 400
     assert "上限" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------- 事务与并发
+
+def test_failed_import_leaves_no_partial_data(monkeypatch, tmp_path):
+    """摘要构建阶段失败时，tests/samples/blocks 都不得留下半成品。"""
+    from app import ingest as ingest_mod
+    from app.db import connect
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("simulated summary build failure")
+
+    monkeypatch.setattr(ingest_mod, "build_summaries", boom)
+
+    # 默认 TestClient 会把服务端异常直接抛出；这里需要观察真实 HTTP 行为
+    raising_client = TestClient(app, raise_server_exceptions=False)
+    rows = [(2000 + i, float(i)) for i in range(12)]
+    resp = raising_client.post(
+        "/tests/import",
+        data={"name": "atomic-fail"},
+        files={"file": ("u.csv", _csv(rows), "text/csv")},
+    )
+    # 非校验类错误应表现为 5xx，而不是静默 201
+    assert resp.status_code >= 500
+
+    conn = connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tests WHERE name = 'atomic-fail'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM samples WHERE test_id NOT IN (SELECT id FROM tests)"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM blocks WHERE test_id NOT IN (SELECT id FROM tests)"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_receipt_id_is_queryable_immediately():
+    """回执里的试验编号必须立刻可查（提交先于响应返回）。"""
+    rows = [(3000 + i * 10, float(i)) for i in range(20)]
+    resp = client.post(
+        "/tests/import",
+        data={"name": "receipt-now"},
+        files={"file": ("u.csv", _csv(rows), "text/csv")},
+    )
+    assert resp.status_code == 201, resp.text
+    tid = resp.json()["id"]
+
+    detail = client.get(f"/tests/{tid}")
+    assert detail.status_code == 200
+    assert detail.json()["id"] == tid
+
+    q = client.get(
+        f"/tests/{tid}/query",
+        params={"start_ts": 3000, "end_ts": 3200, "bucket_width_ms": 100},
+    )
+    assert q.status_code == 200
+    assert sum(b["sample_count"] for b in q.json()["buckets"]) == 20
+
+
+def test_concurrent_reads_during_import_never_500(monkeypatch):
+    """导入进行中，已入库试验的并发查询必须全部成功（WAL：读写不互斥）。"""
+    import threading
+
+    # 先准备一个已提交的试验供读者查询
+    seed = client.post(
+        "/tests/import",
+        data={"name": "concurrent-seed"},
+        files={"file": ("s.csv", _csv([(4000 + i, float(i)) for i in range(40)]),
+                        "text/csv")},
+    )
+    assert seed.status_code == 201
+    seed_id = seed.json()["id"]
+
+    errors: list = []
+    barrier = threading.Barrier(9)  # 8 个读者 + 1 个导入者
+
+    real_build = __import__("app.summaries", fromlist=["build_summaries"]).build_summaries
+
+    def gated_build(conn, test_id, block_size):
+        barrier.wait(timeout=10)  # 读者全部进入查询后再开始写摘要
+        return real_build(conn, test_id, block_size)
+
+    monkeypatch.setattr("app.ingest.build_summaries", gated_build)
+
+    def reader():
+        # 每个线程使用独立的 TestClient（其内部 httpx 连接池不保证线程安全）
+        local_client = TestClient(app)
+        barrier.wait(timeout=10)
+        for _ in range(20):
+            r = local_client.get(
+                f"/tests/{seed_id}/query",
+                params={"start_ts": 4000, "end_ts": 4040, "bucket_width_ms": 10},
+            )
+            if r.status_code != 200:
+                errors.append((r.status_code, r.text[:120]))
+
+    threads = [threading.Thread(target=reader) for _ in range(8)]
+    for t in threads:
+        t.start()
+
+    imp = client.post(
+        "/tests/import",
+        data={"name": "concurrent-writer"},
+        files={"file": ("w.csv", _csv([(5000 + i, float(i)) for i in range(40)]),
+                        "text/csv")},
+    )
+    for t in threads:
+        t.join()
+
+    assert imp.status_code == 201, imp.text
+    assert errors == []
+
+
+def test_concurrent_distinct_imports_all_commit():
+    """多个不同试验并发导入：busy_timeout 让写者排队，全部成功且数据完整。"""
+    import threading
+
+    failures: list = []
+    committed: list = []
+
+    def importer(k: int):
+        local_client = TestClient(app)
+        r = local_client.post(
+            "/tests/import",
+            data={"name": f"parallel-{k}"},
+            files={"file": (f"p{k}.csv",
+                            _csv([(6000 + k * 1000 + i, float(i)) for i in range(24)]),
+                            "text/csv")},
+        )
+        if r.status_code != 201:
+            failures.append((k, r.status_code, r.text[:120]))
+        else:
+            committed.append((k, r.json()["id"]))
+
+    threads = [threading.Thread(target=importer, args=(k,)) for k in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert failures == []
+    assert len(committed) == 5
+    listing = {t["name"] for t in client.get("/tests").json()}
+    assert {f"parallel-{k}" for k in range(5)} <= listing
+    # 每个试验的采样与摘要都随事务一起落盘
+    from app.db import connect
+    conn = connect()
+    try:
+        for _, tid in committed:
+            n_samples = conn.execute(
+                "SELECT COUNT(*) FROM samples WHERE test_id = ?", (tid,)
+            ).fetchone()[0]
+            n_blocks = conn.execute(
+                "SELECT COUNT(*) FROM blocks WHERE test_id = ?", (tid,)
+            ).fetchone()[0]
+            assert n_samples == 24 and n_blocks >= 1
+    finally:
+        conn.close()
+
+
+def test_database_runs_in_wal_mode():
+    """WAL 是“导入期间可查询”的前提，启动建库后必须确实生效。"""
+    from app.db import connect
+    conn = connect()
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
+    assert str(mode).lower() == "wal"
+

@@ -6,6 +6,7 @@
 
 输出：
     sample_data/pump_start_demo.csv   2 万点、含启泵水锤振荡与尖峰深谷
+    sample_data/large_demo.csv        20 万点大文件，用于演示边导入边查询
     sample_data/small_demo.csv        60 点小样本，便于在 Swagger 里肉眼核对
 列：timestamp_ms,pressure_kpa；毫秒时间戳严格递增。
 """
@@ -55,6 +56,7 @@ def write_csv(path: Path, count: int, interval_ms: int) -> None:
 def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
     write_csv(OUT_DIR / "pump_start_demo.csv", count=20_000, interval_ms=10)
+    write_csv(OUT_DIR / "large_demo.csv", count=200_000, interval_ms=10)
     write_csv(OUT_DIR / "small_demo.csv", count=60, interval_ms=100)
 
 

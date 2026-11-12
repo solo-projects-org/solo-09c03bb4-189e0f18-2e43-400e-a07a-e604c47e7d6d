@@ -14,6 +14,7 @@ import math
 import sqlite3
 
 from . import config
+from .db import transaction
 from .summaries import build_summaries
 
 
@@ -118,25 +119,32 @@ def import_test(
     content: bytes,
     block_size: int | None = None,
 ) -> dict:
-    """完整导入一次试验：采样入库 + 多级摘要，单事务完成。"""
+    """完整导入一次试验：采样入库 + 多级摘要，单事务完成。
+
+    解析与校验在事务之外完成（不持有写锁）；通过校验后在一个
+    BEGIN IMMEDIATE 事务里依次写 tests / samples / blocks，任一步失败
+    整体回滚，只有 commit 成功后数据才对其他连接可见。
+    """
     block_size = block_size or config.BLOCK_SIZE
     samples = parse_csv(content)
 
     try:
-        cur = conn.execute(
-            "INSERT INTO tests (name, source_filename, sample_count, start_ts, end_ts, max_level) "
-            "VALUES (?, ?, ?, ?, ?, 0)",
-            (name, filename, len(samples), samples[0][0], samples[-1][0]),
-        )
-        test_id = cur.lastrowid
-        conn.executemany(
-            "INSERT INTO samples (test_id, ts, pressure) VALUES (?, ?, ?)",
-            [(test_id, ts, p) for ts, p in samples],
-        )
-        max_level = build_summaries(conn, test_id, block_size)
-        conn.execute(
-            "UPDATE tests SET max_level = ? WHERE id = ?", (max_level, test_id)
-        )
+        with transaction(conn):
+            cur = conn.execute(
+                "INSERT INTO tests (name, source_filename, sample_count, start_ts, end_ts, max_level) "
+                "VALUES (?, ?, ?, ?, ?, 0)",
+                (name, filename, len(samples), samples[0][0], samples[-1][0]),
+            )
+            test_id = cur.lastrowid
+            conn.executemany(
+                "INSERT INTO samples (test_id, ts, pressure) VALUES (?, ?, ?)",
+                [(test_id, ts, p) for ts, p in samples],
+            )
+            max_level = build_summaries(conn, test_id, block_size)
+            conn.execute(
+                "UPDATE tests SET max_level = ? WHERE id = ?",
+                (max_level, test_id),
+            )
     except sqlite3.IntegrityError as exc:
         raise CsvValidationError(f"试验名称 {name!r} 已存在") from exc
 
@@ -149,6 +157,8 @@ def import_test(
     imported_at = conn.execute(
         "SELECT imported_at FROM tests WHERE id = ?", (test_id,)
     ).fetchone()[0]
+    # 上面的 SELECT 在默认隔离级别下会隐式开启只读事务，主动提交保持连接干净
+    conn.commit()
     return {
         "id": test_id,
         "name": name,
