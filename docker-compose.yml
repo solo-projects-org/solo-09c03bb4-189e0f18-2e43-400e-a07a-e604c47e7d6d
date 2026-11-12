@@ -1,0 +1,21 @@
+services:
+  pump-api:
+    build: .
+    image: pump-hammer-api:1.0.0
+    container_name: pump-hammer-api
+    ports:
+      - "8000:8000"
+    environment:
+      PUMP_DB_PATH: /data/pump_tests.db
+      PUMP_BLOCK_SIZE: "128"
+    volumes:
+      - pump-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pump-data:
